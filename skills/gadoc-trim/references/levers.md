@@ -6,8 +6,8 @@ Prefer the lowest lever that fixes the finding. Every lever is reversible throug
 
 | Goal | Lever | Journal | Verify |
 |---|---|---|---|
-| Hide a skill folder from grok | Add its folder to `[skills].ignore` in `~/.grok/config.toml` | `backup <id> ~/.grok/config.toml` | skill gone from `grok inspect --json` `.skills` |
-| Hide a whole plugin (incl. Claude Code plugins grok inherits) | Add the plugin ID to `[plugins].disabled` in `~/.grok/config.toml` | `backup` config.toml | plugin `enabled: false` or absent in `inspect.plugins`; if unchanged, roll back and report the ID format as unknown |
+| Hide a skill folder from grok | Add its folder (or a parent folder, `~` allowed, e.g. `ignore = ["~/.claude/skills/synced"]`) to `[skills].ignore` in `~/.grok/config.toml` | `backup <id> ~/.grok/config.toml` | skill gone from `grok inspect --json` `.skills` |
+| Hide a whole plugin (incl. Claude Code plugins grok inherits) | Add the plugin name to `[plugins].disabled` in `~/.grok/config.toml` (e.g. `disabled = ["superpowers"]`). `grok plugin disable` only works for plugins installed with `grok plugin install` | `backup` config.toml | the plugin's skills disappear from `inspect.skills`. Tested on grok 1.0.41: `inspect.plugins[].enabled` and plugin hook entries may still show - judge by the skills list |
 | Turn off an MCP server for grok | `grok mcp disable <name>` | `record --do "grok mcp disable <name>" --undo "grok mcp enable <name>"` | `grok mcp list` / `inspect.mcpServers` |
 | Fix a truncated or conflicting grok rule | Edit the rule file (show the exact diff first) | `backup <rule file>` | `inspect.projectInstructions` size |
 | Remove an auto-approve alias | Comment the line out in the shell rc file | `backup ~/.zshrc` | `grep` the line; new shell |
