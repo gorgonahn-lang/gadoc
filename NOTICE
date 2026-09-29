@@ -1,0 +1,16 @@
+gadoc - grok / Antigravity CLI edition of HarDoc
+
+This project is a derivative work of HarDoc:
+  HarDoc - a read-only harness checkup for Claude Code and Codex
+  Copyright (c) QuantumJumpClub (https://github.com/qjc-office)
+  https://github.com/qjc-office/hardoc
+
+The procedures, checks, safety rules, modes, flags, evaluation contract and
+documentation structure of HarDoc's `skill-governor` and `trim` skills were
+adapted for grok (Grok Build) and Antigravity CLI (agy) with the permission of
+the HarDoc author. HarDoc itself is distributed under its own terms (see its
+repository); the permission to adapt it was granted to the gadoc author and
+does not relicense HarDoc.
+
+Code written for gadoc (scripts/collect.py, scripts/snapshot.py, install.sh)
+is licensed under the MIT License in LICENSE.

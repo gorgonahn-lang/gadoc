@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
-"""gadoc inventory collector.
+"""gadoc inventory collector for grok (Grok Build) and Antigravity CLI (agy).
 
-Read-only snapshot of the grok (Grok Build) and Antigravity CLI (agy) harness:
-skills, plugins, MCP servers, hooks, rule files and shell aliases, plus the
-findings that can be decided mechanically. Nothing on disk is modified.
+Read-only. Verifies the target directory, records the runtime environment,
+runs the doctor/listing surfaces each installed CLI actually supports, and
+collects skills, plugins, MCP servers, hooks, rule files, shell aliases and
+recent-use evidence. Secrets are masked. Nothing on disk is modified except
+the --out file.
 
 Usage:
-  python3 collect.py [--project DIR] [--harness grok|agy|both] [--out FILE] [--summary]
+  python3 collect.py [--project DIR] [--harness grok|agy|both] [--out FILE]
+                     [--summary] [--no-connect] [--usage-days N]
+Exit codes: 0 ok, 2 target path invalid (nothing was run).
 """
 import argparse
 import datetime
 import glob
+import hashlib
 import json
 import os
+import platform
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import time
 
 HOME = os.path.expanduser("~")
 GROK_HOME = os.environ.get("GROK_HOME", os.path.join(HOME, ".grok"))
@@ -24,11 +32,11 @@ AGY_CONFIG = os.path.join(HOME, ".gemini", "config")
 AGY_CLI_HOME = os.path.join(HOME, ".gemini", "antigravity-cli")
 AGY_WORKSPACE_ROOTS = (".agents", ".agent", "_agents", "_agent")
 SECRET_KEY = re.compile(r"(key|token|secret|passw|auth|cookie|credential|bearer)", re.I)
+URL_QUERY = re.compile(r"(https?://[^\s\"'?#]+)\?[^\s\"']*")
 AUTO_APPROVE = re.compile(
     r"--always-approve|--dangerously-skip-permissions|--permission-mode[ =]+(bypassPermissions|dontAsk)"
 )
 
-# Limits documented by each harness.
 GROK_RULE_CHAR_CAP = 10000          # per AGENTS.md-style file, truncated beyond this
 AGY_RULE_BYTE_CAP = 24000           # per rule file
 AGY_RULES_TOKEN_BUDGET = 20000      # always-on + global rules, shared budget
@@ -38,32 +46,47 @@ DESCRIPTION_CHAR_WARN = 1024
 # ---------------------------------------------------------------- helpers
 
 def run(cmd, cwd=None, timeout=90):
+    """Run a command; return command, exit code, doctor-style status and output."""
+    rec = {"command": " ".join(cmd), "cwd": cwd}
     try:
         p = subprocess.run(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                            stderr=subprocess.PIPE, universal_newlines=True, timeout=timeout)
-        return {"rc": p.returncode, "out": p.stdout, "err": p.stderr[-2000:]}
+        rec.update(rc=p.returncode, status="COMPLETED" if p.returncode == 0 else "ERROR",
+                   out=p.stdout, err=mask_text(p.stderr[-2000:]))
     except FileNotFoundError:
-        return {"rc": None, "out": "", "err": "not installed"}
+        rec.update(rc=None, status="NOT_RUN", out="", err="not installed")
     except subprocess.TimeoutExpired:
-        return {"rc": None, "out": "", "err": "timeout after %ss" % timeout}
+        rec.update(rc=None, status="TIMEOUT", out="", err="timeout after %ss" % timeout)
+    return rec
 
 
-def real_binary(name, env_var):
-    """Find the real executable, skipping shell-script wrappers (e.g. terminal shims)."""
+def mask_text(text):
+    text = URL_QUERY.sub(r"\1?***", text or "")
+    return re.sub(r"(?i)((?:api[_-]?key|token|secret|password|bearer)[\"'=: ]+)[^\s\"',]+", r"\1***", text)
+
+
+def binary_info(name, env_var):
+    """Real executable (skipping shell-script shims) plus any shim that shadows it on PATH."""
     forced = os.environ.get(env_var)
-    if forced:
-        return forced
+    shims, real = [], None
     for d in os.environ.get("PATH", "").split(os.pathsep) + ["/opt/homebrew/bin", "/usr/local/bin"]:
         cand = os.path.join(d, name)
-        if os.path.isfile(cand) and os.access(cand, os.X_OK):
-            try:
-                with open(os.path.realpath(cand), "rb") as f:
-                    head = f.read(2)
-            except OSError:
-                continue
-            if head != b"#!":
-                return cand
-    return shutil.which(name)
+        if not (os.path.isfile(cand) and os.access(cand, os.X_OK)):
+            continue
+        try:
+            with open(os.path.realpath(cand), "rb") as f:
+                is_script = f.read(2) == b"#!"
+        except OSError:
+            continue
+        if is_script:
+            if cand not in shims and real is None:
+                shims.append(cand)
+        elif real is None:
+            real = cand
+    real = forced or real or shutil.which(name)
+    if not real:
+        return None
+    return {"path": real, "realpath": os.path.realpath(real), "shadowing_shims": shims}
 
 
 def approx_tokens(n_chars):
@@ -78,14 +101,25 @@ def read_text(path, limit=None):
         return None
 
 
+def sha256(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError:
+        return None
+
+
 def frontmatter(path):
-    """Minimal YAML frontmatter reader for name/description (handles >- and | blocks)."""
+    """Minimal YAML frontmatter reader (scalars, >- and | blocks). Returns None if unreadable,
+    {"__parse_error__": True} if the block is malformed."""
     text = read_text(path, 20000)
     if text is None:
         return None
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
         return {}
+    if not any(l.strip() == "---" for l in lines[1:]):
+        return {"__parse_error__": True}
     data, key, block = {}, None, []
     for line in lines[1:]:
         if line.strip() == "---":
@@ -108,12 +142,18 @@ def frontmatter(path):
     return data
 
 
+def truthy(v):
+    return str(v).strip().lower() in ("true", "yes", "1")
+
+
 def redact(obj):
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
             if k in ("env", "headers") and isinstance(v, dict):
                 out[k] = {ek: "***" for ek in v}
+            elif k == "args" and isinstance(v, list):
+                out[k] = ["***" if SECRET_KEY.search(str(a)) else a for a in v]
             elif SECRET_KEY.search(str(k)) and not isinstance(v, (dict, list)):
                 out[k] = "***"
             else:
@@ -121,6 +161,8 @@ def redact(obj):
         return out
     if isinstance(obj, list):
         return [redact(v) for v in obj]
+    if isinstance(obj, str):
+        return URL_QUERY.sub(r"\1?***", obj)
     return obj
 
 
@@ -168,10 +210,17 @@ def skill_record(skill_md, scope, harness, extra=None):
         "symlink": os.path.islink(d), "exists": os.path.isfile(skill_md),
     }
     fm = frontmatter(skill_md) if rec["exists"] else None
-    rec["name"] = (fm or {}).get("name") or rec["dir_name"]
-    rec["description"] = (fm or {}).get("description", "")
-    rec["frontmatter_ok"] = bool(fm and fm.get("name") and fm.get("description"))
+    fm = fm or {}
+    rec["parse"] = "error" if fm.get("__parse_error__") else ("ok" if fm else ("unknown" if rec["exists"] else "missing"))
+    rec["name"] = fm.get("name") or rec["dir_name"]
+    rec["description"] = fm.get("description", "")
+    rec["frontmatter_ok"] = bool(fm.get("name") and fm.get("description"))
     rec["description_chars"] = len(rec["description"])
+    rec["hash"] = sha256(skill_md) if rec["exists"] else None
+    rec["invocation_policy"] = {
+        "disable_model_invocation": truthy(fm.get("disable-model-invocation", "false")),
+        "user_invocable": not (str(fm.get("user-invocable", "true")).strip().lower() == "false"),
+    }
     if extra:
         rec.update(extra)
     return rec
@@ -191,48 +240,144 @@ def scan_skill_dir(base, scope, harness, extra=None):
 
 def rule_record(path, scope, harness):
     text = read_text(path) or ""
+    fm = frontmatter(path) or {}
     return {
         "harness": harness, "scope": scope, "path": path, "realpath": os.path.realpath(path),
         "bytes": len(text.encode("utf-8")), "chars": len(text), "approx_tokens": approx_tokens(len(text)),
+        "trigger": fm.get("trigger"), "hash": sha256(path),
     }
+
+
+GADOC_SKILLS = ("gadoc", "gadoc-trim")
+
+
+def _grok_loads(line):
+    """SKILL.md paths loaded by a grok read_file tool call in one updates.jsonl line."""
+    try:
+        u = json.loads(line).get("params", {}).get("update", {})
+    except ValueError:
+        return []
+    if u.get("sessionUpdate") != "tool_call" or u.get("title") != "read_file":
+        return []
+    p = str((u.get("rawInput") or {}).get("target_file", ""))
+    return [p] if p.endswith("/SKILL.md") else []
+
+
+def _agy_loads(line):
+    """SKILL.md paths loaded by an agy view_file tool call in one transcript.jsonl line."""
+    try:
+        calls = json.loads(line).get("tool_calls") or []
+    except ValueError:
+        return []
+    out = []
+    for c in calls:
+        if c.get("name") == "view_file":
+            p = str((c.get("args") or {}).get("AbsolutePath", "")).strip("\"'")
+            if p.endswith("/SKILL.md"):
+                out.append(p)
+    return out
+
+
+def usage_from_logs(paths_glob, window_days, parser):
+    """Map SKILL.md realpath -> {count, sessions, last} from sessions modified within the window.
+
+    Counts only real skill loads (the agent reading a SKILL.md with its file-view tool).
+    Sessions that loaded gadoc itself are audits that read other skills on purpose, so
+    only the gadoc skills are counted from them."""
+    cutoff = time.time() - window_days * 86400
+    hits, files_read = {}, 0
+    for f in glob.glob(paths_glob):
+        try:
+            if os.path.getmtime(f) < cutoff:
+                continue
+            files_read += 1
+            loads = []
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if "SKILL.md" in line:
+                        loads += parser(line)
+        except OSError:
+            continue
+        real = [os.path.realpath(p) for p in loads]
+        audit = any(os.path.basename(os.path.dirname(p)) in GADOC_SKILLS for p in real)
+        mt = datetime.datetime.fromtimestamp(os.path.getmtime(f)).isoformat(timespec="seconds")
+        for rp in set(real):
+            if audit and os.path.basename(os.path.dirname(rp)) not in GADOC_SKILLS:
+                continue
+            h = hits.setdefault(rp, {"count": 0, "sessions": 0, "last": None})
+            h["count"] += real.count(rp)
+            h["sessions"] += 1
+            h["last"] = max(h["last"] or mt, mt)
+    return hits, files_read
+
+
+def item(installed, enabled, exposed, invoked, usage, cost_chars, evidence, dependency="unknown"):
+    return {"installed": installed, "enabled": enabled, "exposed": exposed, "invoked": invoked,
+            "usage_window": usage.get("window"), "usage_source": usage.get("source"),
+            "dependency": dependency, "always_cost_chars": cost_chars,
+            "always_cost_tokens": approx_tokens(cost_chars) if isinstance(cost_chars, int) else "unknown",
+            "evidence": evidence}
 
 
 # ---------------------------------------------------------------- grok
 
-def collect_grok(project):
+def collect_grok(project, no_connect, usage_days):
     g = {"installed": False}
-    binary = real_binary("grok", "GADOC_GROK_BIN")
-    if not binary:
+    info = binary_info("grok", "GADOC_GROK_BIN")
+    if not info:
         return g
-    g.update(installed=True, binary=binary, home=GROK_HOME)
+    binary = info["path"]
+    g.update(installed=True, binary=info, home=GROK_HOME)
     g["version"] = run([binary, "--version"], timeout=20)["out"].strip()
+    help_text = run([binary, "--help"], timeout=20)["out"]
 
     r = run([binary, "inspect", "--json"], cwd=project, timeout=120)
     try:
         g["inspect"] = redact(json.loads(r["out"]))
+        g["inspect_status"] = "COMPLETED"
     except ValueError:
         g["inspect"] = None
+        g["inspect_status"] = r["status"] if r["status"] != "COMPLETED" else "ERROR"
         g["inspect_error"] = (r["err"] or r["out"])[:500]
+    ins = g["inspect"] or {}
 
-    r = run([binary, "mcp", "doctor", "--json"], cwd=project, timeout=180)
-    try:
-        g["mcp_doctor"] = redact(json.loads(r["out"]))
-    except ValueError:
-        g["mcp_doctor"] = {"rc": r["rc"], "text": (r["out"] or r["err"])[:2000]}
+    # Doctors. `grok doctor fix` applies changes, so only the read-only forms are run.
+    doctors = []
+    if re.search(r"^\s+doctor\b", help_text, re.M):
+        d = run([binary, "doctor"], cwd=project, timeout=60)
+        d["scope"] = "terminal, clipboard, color and input support only (not skills/plugins/rules)"
+        d["out"] = mask_text(d["out"][-3000:])
+        doctors.append(d)
+    else:
+        doctors.append({"command": "grok doctor", "status": "UNSUPPORTED"})
+    project_mcp = any(os.path.isfile(os.path.join(dd, n)) for dd in dirs_root_to_cwd(project)
+                      for n in (os.path.join(".grok", "config.toml"), ".mcp.json"))
+    if no_connect:
+        doctors.append({"command": "grok mcp doctor --json", "status": "NOT_RUN", "reason": "--no-connect"})
+    elif project_mcp and not ins.get("projectTrusted"):
+        doctors.append({"command": "grok mcp doctor --json", "status": "NOT_RUN",
+                        "reason": "project defines MCP servers and is not trusted; connection state unknown"})
+    else:
+        d = run([binary, "mcp", "doctor", "--json"], cwd=project, timeout=180)
+        d["scope"] = "MCP server configuration and connectivity (starts configured servers)"
+        try:
+            d["result"] = redact(json.loads(d["out"]))
+        except ValueError:
+            d["result"] = None
+        d["out"] = mask_text(d["out"][-3000:])
+        doctors.append(d)
+    g["doctors"] = doctors
 
     cfg = os.path.join(GROK_HOME, "config.toml")
     text = read_text(cfg)
     g["config_toml"] = {"path": cfg, "exists": text is not None}
     if text is not None:
-        tables = re.findall(r"^\s*\[\[?([^\]]+)\]\]?\s*$", text, re.M)
-        g["config_toml"]["tables"] = tables
+        g["config_toml"]["tables"] = re.findall(r"^\s*\[\[?([^\]]+)\]\]?\s*$", text, re.M)
         for section in ("skills", "plugins"):
             m = re.search(r"^\s*\[%s\]\s*$(.*?)(?=^\s*\[|\Z)" % section, text, re.M | re.S)
             if m:
                 g["config_toml"][section] = m.group(1).strip()
 
-    # Skill folders on disk that grok scans, so shadowing can be seen even though
-    # `grok inspect` only lists the winner of each name.
     disk = []
     for d in dirs_root_to_cwd(project):
         disk += scan_skill_dir(os.path.join(d, ".grok", "skills"), "project", "grok")
@@ -241,6 +386,41 @@ def collect_grok(project):
     disk += scan_skill_dir(os.path.join(HOME, ".claude", "skills"), "user-claude-compat", "grok")
     disk += scan_skill_dir(os.path.join(HOME, ".agents", "skills"), "user-agents-compat", "grok")
     g["skill_dirs_on_disk"] = disk
+
+    usage, files_read = usage_from_logs(os.path.join(GROK_HOME, "sessions", "*", "*", "updates.jsonl"), usage_days, _grok_loads)
+    usage_meta = {"window": "%dd" % usage_days,
+                  "source": "grok session logs on this host (%d sessions; read_file of SKILL.md; gadoc audit sessions excluded)" % files_read}
+    g["usage_meta"] = usage_meta
+
+    items = []
+    for s in ins.get("skills", []):
+        path = (s.get("source") or {}).get("path")
+        rec = skill_record(path, (s.get("source") or {}).get("type", "unknown"), "grok") if path else {}
+        u = usage.get(os.path.realpath(path)) if path else None
+        policy = rec.get("invocation_policy", {})
+        exposed = "listed" if not policy.get("disable_model_invocation") else "user-invocable only"
+        items.append(dict(kind="skill", name=s.get("name"), source=s.get("source"), hash=rec.get("hash"),
+                          invocation_policy=policy, description_chars=len(s.get("description", "")),
+                          recent_use=u,
+                          **item(True, True, exposed, (u or {}).get("count", "unknown") if files_read else "unknown",
+                                 usage_meta, len(s.get("description", "")) if exposed == "listed" else 0,
+                                 "grok inspect --json")))
+    for p in ins.get("plugins", []):
+        items.append(dict(kind="plugin", name=p.get("name"), source={"type": p.get("scope"), "path": p.get("path")},
+                          provides=p.get("provides"),
+                          **item(True, p.get("enabled"), "see provided skills", "unknown", usage_meta, "sum of provided items",
+                                 "grok inspect --json")))
+    for m in ins.get("mcpServers", []):
+        items.append(dict(kind="mcp", name=m.get("name"), detail=m,
+                          **item(True, m.get("enabled", "unknown"), "unknown", "unknown", usage_meta, "unknown",
+                                 "grok inspect --json")))
+    for h in ins.get("hooks", []):
+        items.append(dict(kind="hook", name=h.get("event"), source=h.get("source"),
+                          **item(True, "unknown", "registered", "unknown", usage_meta, 0, "grok inspect --json")))
+    for pi in ins.get("projectInstructions", []):
+        items.append(dict(kind="rule", name=pi.get("path"), detail=pi,
+                          **item(True, True, "always", "n/a", usage_meta, pi.get("sizeBytes", 0), "grok inspect --json")))
+    g["items"] = items
     return g
 
 
@@ -260,21 +440,26 @@ def json_entries(config_path):
     return out
 
 
-def collect_agy(project):
+def collect_agy(project, usage_days):
     a = {"installed": False}
-    binary = real_binary("agy", "GADOC_AGY_BIN")
-    if not binary:
+    info = binary_info("agy", "GADOC_AGY_BIN")
+    if not info:
         return a
-    a.update(installed=True, binary=binary, config_root=AGY_CONFIG)
+    binary = info["path"]
+    a.update(installed=True, binary=info, config_root=AGY_CONFIG)
     a["version"] = run([binary, "--version"], cwd=HOME, timeout=20)["out"].strip()
-    a["plugin_list_text"] = run([binary, "plugin", "list"], cwd=project, timeout=60)["out"].strip()
-    a["mcp_list_text"] = run([binary, "mcp", "list"], cwd=project, timeout=60)["out"].strip()
+    help_text = run([binary, "--help"], cwd=HOME, timeout=20)["out"]
+    a["doctors"] = [{"command": "agy doctor", "status": "UNSUPPORTED",
+                     "reason": "agy --help lists no doctor/diagnose subcommand"}] \
+        if not re.search(r"^\s+doctor\b", help_text, re.M) else [run([binary, "doctor"], cwd=project, timeout=60)]
+    pl = run([binary, "plugin", "list"], cwd=project, timeout=60)
+    ml = run([binary, "mcp", "list"], cwd=project, timeout=60)
+    a["listings"] = [{"command": x["command"], "status": x["status"], "out": mask_text(x["out"].strip()[:3000])} for x in (pl, ml)]
 
     walk = dirs_root_to_cwd(project)
     workspace_roots = [os.path.join(d, r) for d in walk for r in AGY_WORKSPACE_ROOTS
                        if os.path.isdir(os.path.join(d, r))]
 
-    # Rules
     rules = []
     for name in ("AGENTS.md", "GEMINI.md"):
         p = os.path.join(AGY_CONFIG, name)
@@ -289,7 +474,6 @@ def collect_agy(project):
         for p in sorted(glob.glob(os.path.join(root, "rules", "*.md"))):
             rules.append(rule_record(p, "workspace-rules", "agy"))
 
-    # Plugins
     config_json, config_state = load_json(os.path.join(AGY_CONFIG, "config.json"))
     enabled_map = (config_json or {}).get("plugins", {}) if isinstance(config_json, dict) else {}
     plugin_dirs = [(os.path.join(AGY_CONFIG, "plugins"), "global")]
@@ -304,7 +488,8 @@ def collect_agy(project):
             data, state = load_json(manifest)
             dname = os.path.basename(pdir)
             declared_off = bool(isinstance(data, dict) and data.get("disabled"))
-            user_pref = enabled_map.get(dname, {}).get("enabled") if isinstance(enabled_map.get(dname), dict) else None
+            pref = enabled_map.get(dname)
+            user_pref = pref.get("enabled") if isinstance(pref, dict) else None
             enabled = user_pref if user_pref is not None else not declared_off
             plugins.append({"dir": pdir, "dir_name": dname, "scope": scope, "manifest_state": state,
                             "name": (data or {}).get("name", dname) if isinstance(data, dict) else dname,
@@ -313,7 +498,6 @@ def collect_agy(project):
                 for p in sorted(glob.glob(os.path.join(pdir, "rules", "*.md"))):
                     rules.append(rule_record(p, "plugin:" + dname, "agy"))
 
-    # Skills (priority: workspace > declared > global > builtin)
     skills = []
     for root in workspace_roots:
         skills += scan_skill_dir(os.path.join(root, "skills"), "workspace", "agy")
@@ -329,13 +513,12 @@ def collect_agy(project):
             skills += scan_skill_dir(os.path.join(p["dir"], "skills"), "plugin:" + p["dir_name"], "agy")
     skills += scan_skill_dir(os.path.join(AGY_CLI_HOME, "builtin", "skills"), "builtin", "agy")
 
-    # MCP servers
     mcp = []
     mcp_files = [(os.path.join(AGY_CONFIG, "mcp_config.json"), "global")]
     mcp_files += [(os.path.join(p["dir"], "mcp_config.json"), "plugin:" + p["dir_name"]) for p in plugins if p["enabled"]]
     for path, scope in mcp_files:
         data, state = load_json(path)
-        if state not in ("ok",):
+        if state != "ok":
             if state not in ("missing", "empty"):
                 mcp.append({"scope": scope, "path": path, "error": state})
             continue
@@ -348,10 +531,9 @@ def collect_agy(project):
                 rec["command"] = srv["command"]
                 rec["command_found"] = bool(shutil.which(srv["command"]) or os.path.isfile(srv["command"]))
             if srv.get("serverUrl"):
-                rec["serverUrl"] = srv["serverUrl"]
+                rec["serverUrl"] = URL_QUERY.sub(r"\1?***", srv["serverUrl"])
             mcp.append(rec)
 
-    # Hooks
     hooks = []
     hook_files = [(os.path.join(AGY_CONFIG, "hooks.json"), "global"),
                   (os.path.join(AGY_CLI_HOME, "hooks.json"), "cli")]
@@ -364,9 +546,46 @@ def collect_agy(project):
         elif state not in ("missing", "empty"):
             hooks.append({"scope": scope, "path": path, "error": state})
 
+    usage, files_read = usage_from_logs(
+        os.path.join(AGY_CLI_HOME, "brain", "*", ".system_generated", "logs", "transcript.jsonl"), usage_days, _agy_loads)
+    usage_meta = {"window": "%dd" % usage_days,
+                  "source": "agy transcripts on this host (%d conversations; view_file of SKILL.md; gadoc audit sessions excluded)" % files_read}
+
+    items = []
+    for s in skills:
+        u = usage.get(s["realpath"])
+        listed = not s.get("excluded") and not s["invocation_policy"]["disable_model_invocation"]
+        s["recent_use"] = u
+        items.append(dict(kind="skill", name=s["name"], source={"type": s["scope"], "path": s["path"]},
+                          hash=s["hash"], invocation_policy=s["invocation_policy"], recent_use=u,
+                          **item(s["exists"], not s.get("excluded"), "listed" if listed else "not listed",
+                                 (u or {}).get("count", 0 if files_read else "unknown"), usage_meta,
+                                 s["description_chars"] if listed else 0, "filesystem scan")))
+    for p in plugins:
+        items.append(dict(kind="plugin", name=p["name"], source={"type": p["scope"], "path": p["dir"]},
+                          **item(True, p["enabled"], "see provided items", "unknown", usage_meta,
+                                 "sum of provided items", "filesystem scan + agy plugin list")))
+    for m in mcp:
+        if m.get("name"):
+            items.append(dict(kind="mcp", name=m["name"], detail=m,
+                              **item(True, not m.get("disabled"), "unknown", "unknown", usage_meta, "unknown",
+                                     "mcp_config.json + agy mcp list")))
+    seen = set()
+    for r in rules:
+        if r["realpath"] in seen:
+            continue
+        seen.add(r["realpath"])
+        always = r["trigger"] in (None, "always_on")
+        items.append(dict(kind="rule", name=r["path"], detail=r,
+                          **item(True, True, "always" if always else r["trigger"], "n/a", usage_meta,
+                                 r["chars"] if always else 0, "filesystem scan")))
+    for h in hooks:
+        items.append(dict(kind="hook", name=h["path"], source={"type": h["scope"]},
+                          **item(True, "unknown", "registered", "unknown", usage_meta, 0, "filesystem scan")))
+
     settings, _ = load_json(os.path.join(AGY_CLI_HOME, "settings.json"))
     a.update(project_dirs=walk, workspace_roots=workspace_roots, rules=rules, plugins=plugins,
-             skills=skills, mcp_servers=mcp, hooks=hooks,
+             skills=skills, mcp_servers=mcp, hooks=hooks, usage_meta=usage_meta, items=items,
              config_json_state=config_state, settings=redact(settings or {}))
     return a
 
@@ -389,59 +608,67 @@ def collect_shell():
 
 # ---------------------------------------------------------------- findings
 
-def add(findings, fid, harness, severity, title, evidence, fix=None):
-    findings.append({"id": fid, "harness": harness, "severity": severity, "title": title,
+def add(findings, fid, harness, severity, cls, title, evidence, fix=None):
+    findings.append({"id": fid, "harness": harness, "severity": severity, "class": cls, "title": title,
                      "evidence": evidence, "suggested_fix": fix})
 
 
 def find_issues(data):
     f = []
     grok, agy = data.get("grok", {}), data.get("agy", {})
+    FIX, CAND, OBS = "fix candidate", "cleanup candidate", "insufficient observation"
 
-    # grok
     if grok.get("installed"):
         ins = grok.get("inspect") or {}
         if not ins:
-            add(f, "GROK-INSPECT", "grok", "high", "`grok inspect --json` failed", grok.get("inspect_error"))
-        loaded = ins.get("skills", [])
+            add(f, "GROK-INSPECT", "grok", "high", FIX, "`grok inspect --json` did not complete", grok.get("inspect_error"))
+        if grok["binary"].get("shadowing_shims"):
+            add(f, "GROK-WRAPPER", "grok", "info", OBS, "a shell wrapper precedes the grok binary on PATH",
+                grok["binary"]["shadowing_shims"], "diagnosis used the real binary; check the wrapper separately if runs differ")
         by_name = {}
         for rec in grok.get("skill_dirs_on_disk", []):
             by_name.setdefault(rec["name"], []).append(rec)
         for name, recs in sorted(by_name.items()):
-            paths = sorted(set(r["realpath"] for r in recs))
-            if len(recs) > 1 and len(paths) > 1:
-                add(f, "GROK-SHADOW", "grok", "medium",
+            if len(recs) > 1 and len(set(r["realpath"] for r in recs)) > 1:
+                add(f, "GROK-SHADOW", "grok", "medium", CAND,
                     "skill name `%s` exists in %d grok skill folders; only one wins" % (name, len(recs)),
                     [r["path"] for r in recs], "keep one copy or ignore the others via [skills].ignore")
         for rec in grok.get("skill_dirs_on_disk", []):
             if rec["symlink"] and not rec["exists"]:
-                add(f, "GROK-BROKEN-SKILL", "grok", "medium", "broken skill symlink", rec["dir"], "remove or repoint the link")
+                add(f, "GROK-BROKEN-SKILL", "grok", "medium", FIX, "broken skill symlink", rec["dir"])
+            elif rec["parse"] == "error":
+                add(f, "GROK-SKILL-PARSE", "grok", "medium", FIX, "SKILL.md frontmatter does not parse", rec["path"])
             elif rec["exists"] and not rec["frontmatter_ok"]:
-                add(f, "GROK-SKILL-FRONTMATTER", "grok", "low", "SKILL.md missing name/description", rec["path"])
-        compat = [s for s in loaded if (s.get("source") or {}).get("type") in ("plugin", "user")
-                  and "/.claude/" in (s.get("source") or {}).get("path", "")]
+                add(f, "GROK-SKILL-FRONTMATTER", "grok", "low", FIX, "SKILL.md missing name/description", rec["path"])
+        loaded = ins.get("skills", [])
+        compat = [s for s in loaded if "/.claude/" in (s.get("source") or {}).get("path", "")]
         if compat:
-            add(f, "GROK-CLAUDE-COMPAT", "grok", "info",
+            add(f, "GROK-CLAUDE-COMPAT", "grok", "info", OBS,
                 "%d of %d grok skills come from Claude Code folders/plugins" % (len(compat), len(loaded)),
                 sorted(set((s.get("source") or {}).get("plugin_name") or "~/.claude/skills" for s in compat)),
-                "if grok does not need them, use [plugins].disabled / [skills].ignore in ~/.grok/config.toml")
-        total_desc = sum(len(s.get("description", "")) for s in loaded)
-        add(f, "GROK-LISTING-COST", "grok", "info",
-            "%d skills listed; descriptions total %d chars (~%d tokens per request)" % (len(loaded), total_desc, approx_tokens(total_desc)),
-            None)
+                "grok-side [plugins].disabled / [skills].ignore; never edit ~/.claude")
+        listed = [i for i in grok.get("items", []) if i["kind"] == "skill" and i["exposed"] == "listed"]
+        total = sum(i["always_cost_chars"] for i in listed)
+        add(f, "GROK-LISTING-COST", "grok", "info", OBS,
+            "%d of %d skills listed to the model; descriptions total %d chars (~%d tokens per request)" % (
+                len(listed), len(loaded), total, approx_tokens(total)), None)
         for s in loaded:
             if len(s.get("description", "")) > DESCRIPTION_CHAR_WARN:
-                add(f, "GROK-LONG-DESC", "grok", "low", "skill `%s` description is %d chars" % (s["name"], len(s["description"])),
-                    (s.get("source") or {}).get("path"))
+                add(f, "GROK-LONG-DESC", "grok", "low", CAND, "skill `%s` description is %d chars" % (
+                    s["name"], len(s["description"])), (s.get("source") or {}).get("path"))
         for pi in ins.get("projectInstructions", []):
             if pi.get("sizeBytes", 0) > GROK_RULE_CHAR_CAP:
-                add(f, "GROK-RULE-TRUNCATED", "grok", "high",
+                add(f, "GROK-RULE-TRUNCATED", "grok", "high", FIX,
                     "rule file over grok's 10,000-char cap is truncated", pi.get("path"), "shorten or split the file")
-        doc = grok.get("mcp_doctor")
-        if isinstance(doc, dict) and doc.get("rc") not in (None, 0) and "text" in doc:
-            add(f, "GROK-MCP-DOCTOR", "grok", "medium", "`grok mcp doctor` reported a problem", doc.get("text", "")[:400])
+        for d in grok.get("doctors", []):
+            if d["status"] != "COMPLETED":
+                add(f, "GROK-DOCTOR-" + d["status"], "grok", "info", OBS,
+                    "`%s` %s; that check is UNVERIFIED" % (d["command"], d["status"]), d.get("reason") or d.get("err"))
+            res = d.get("result")
+            if isinstance(res, dict) and (res.get("failing") or 0) > 0:
+                add(f, "GROK-MCP-FAILING", "grok", "high", FIX, "`grok mcp doctor` reports failing servers",
+                    res.get("servers") or res)
 
-    # agy
     if agy.get("installed"):
         active = [s for s in agy.get("skills", []) if not s.get("excluded")]
         by_name = {}
@@ -449,54 +676,62 @@ def find_issues(data):
             by_name.setdefault(s["name"], []).append(s)
         for name, recs in sorted(by_name.items()):
             if len(recs) > 1 and len(set(r["realpath"] for r in recs)) > 1:
-                add(f, "AGY-SHADOW", "agy", "medium",
+                add(f, "AGY-SHADOW", "agy", "medium", CAND,
                     "skill name `%s` defined in %d places; higher-priority scope wins" % (name, len(recs)),
                     ["%s (%s)" % (r["path"], r["scope"]) for r in recs], "keep one copy or exclude via skills.json")
         for s in agy.get("skills", []):
             if s["symlink"] and not s["exists"]:
-                add(f, "AGY-BROKEN-SKILL", "agy", "medium", "broken skill symlink", s["dir"], "remove or repoint the link")
+                add(f, "AGY-BROKEN-SKILL", "agy", "medium", FIX, "broken skill symlink", s["dir"])
+            elif s["parse"] == "error":
+                add(f, "AGY-SKILL-PARSE", "agy", "medium", FIX, "SKILL.md frontmatter does not parse", s["path"])
             elif s["exists"] and not s["frontmatter_ok"]:
-                add(f, "AGY-SKILL-FRONTMATTER", "agy", "medium", "SKILL.md missing name/description", s["path"])
+                add(f, "AGY-SKILL-FRONTMATTER", "agy", "medium", FIX, "SKILL.md missing name/description", s["path"])
             if s["description_chars"] > DESCRIPTION_CHAR_WARN:
-                add(f, "AGY-LONG-DESC", "agy", "low", "skill `%s` description is %d chars" % (s["name"], s["description_chars"]), s["path"])
-        total_desc = sum(s["description_chars"] for s in active)
-        add(f, "AGY-LISTING-COST", "agy", "info",
-            "%d skills visible; descriptions total %d chars (~%d tokens per request)" % (len(active), total_desc, approx_tokens(total_desc)),
-            None)
+                add(f, "AGY-LONG-DESC", "agy", "low", CAND, "skill `%s` description is %d chars" % (
+                    s["name"], s["description_chars"]), s["path"])
+        listed = [i for i in agy.get("items", []) if i["kind"] == "skill" and i["exposed"] == "listed"]
+        total = sum(i["always_cost_chars"] for i in listed)
+        add(f, "AGY-LISTING-COST", "agy", "info", OBS,
+            "%d skills listed to the model; descriptions total %d chars (~%d tokens per request)" % (
+                len(listed), total, approx_tokens(total)), None)
         seen, rule_tokens = set(), 0
         for r in agy.get("rules", []):
             if r["realpath"] in seen:
                 continue
             seen.add(r["realpath"])
-            rule_tokens += r["approx_tokens"]
+            if r["trigger"] in (None, "always_on"):
+                rule_tokens += r["approx_tokens"]
             if r["bytes"] > AGY_RULE_BYTE_CAP:
-                add(f, "AGY-RULE-TRUNCATED", "agy", "high", "rule file over agy's 24,000-byte cap is truncated", r["path"])
+                add(f, "AGY-RULE-TRUNCATED", "agy", "high", FIX, "rule file over agy's 24,000-byte cap is truncated", r["path"])
         if rule_tokens > AGY_RULES_TOKEN_BUDGET:
-            add(f, "AGY-RULES-BUDGET", "agy", "high",
-                "rules total ~%d tokens, over agy's 20,000-token rules budget (extras become file pointers)" % rule_tokens, None)
+            add(f, "AGY-RULES-BUDGET", "agy", "high", FIX,
+                "always-on rules ~%d tokens, over agy's 20,000-token rules budget" % rule_tokens, None)
         for m in agy.get("mcp_servers", []):
             if m.get("error"):
-                add(f, "AGY-MCP-CONFIG", "agy", "high", "mcp_config.json cannot be parsed", "%s: %s" % (m["path"], m["error"]))
+                add(f, "AGY-MCP-CONFIG", "agy", "high", FIX, "mcp_config.json cannot be parsed", "%s: %s" % (m["path"], m["error"]))
             elif m.get("command") and not m.get("command_found"):
-                add(f, "AGY-MCP-MISSING-CMD", "agy", "high", "MCP server `%s` command not found" % m["name"], m["command"])
+                add(f, "AGY-MCP-MISSING-CMD", "agy", "high", FIX, "MCP server `%s` command not found" % m["name"], m["command"])
         for h in agy.get("hooks", []):
             if h.get("error"):
-                add(f, "AGY-HOOKS-CONFIG", "agy", "high", "hooks.json cannot be parsed", "%s: %s" % (h["path"], h["error"]))
-        if agy.get("config_json_state", "").startswith("invalid"):
-            add(f, "AGY-CONFIG-JSON", "agy", "high", "~/.gemini/config/config.json cannot be parsed", agy["config_json_state"])
+                add(f, "AGY-HOOKS-CONFIG", "agy", "high", FIX, "hooks.json cannot be parsed", "%s: %s" % (h["path"], h["error"]))
+        if str(agy.get("config_json_state", "")).startswith("invalid"):
+            add(f, "AGY-CONFIG-JSON", "agy", "high", FIX, "~/.gemini/config/config.json cannot be parsed", agy["config_json_state"])
+        for d in agy.get("doctors", []):
+            if d["status"] != "COMPLETED":
+                add(f, "AGY-DOCTOR-" + d["status"], "agy", "info", OBS,
+                    "`%s` %s; doctor verification is UNVERIFIED" % (d["command"], d["status"]), d.get("reason"))
 
-    # cross-harness
     if grok.get("installed") and agy.get("installed"):
-        gl = {(s.get("source") or {}).get("path") and os.path.realpath((s.get("source") or {}).get("path")): s["name"]
-              for s in (grok.get("inspect") or {}).get("skills", [])}
-        both = sorted(set(gl.values()) & set(s["name"] for s in agy.get("skills", []) if s["realpath"] in gl))
+        gl = {os.path.realpath((s.get("source") or {}).get("path")): s["name"]
+              for s in (grok.get("inspect") or {}).get("skills", []) if (s.get("source") or {}).get("path")}
+        both = sorted(set(s["name"] for s in agy.get("skills", []) if s["realpath"] in gl))
         if both:
-            add(f, "CROSS-SHARED-SKILL", "both", "info", "same skill file exposed to both grok and agy", both)
+            add(f, "CROSS-SHARED-SKILL", "both", "info", OBS, "same skill file exposed to both grok and agy", both)
 
     for a in data.get("shell_aliases", []):
         harness = "grok" if re.search(r"\bgrok\b", a["text"]) else "agy"
         if a["auto_approve"] and harness in data:
-            add(f, "SHELL-AUTO-APPROVE", harness, "high",
+            add(f, "SHELL-AUTO-APPROVE", harness, "high", OBS,
                 "shell alias makes every session auto-approve all tool calls",
                 "%s:%d  %s" % (a["file"], a["line"], a["text"]),
                 "keep only if intended; use `command %s` for a prompting session" % harness)
@@ -508,20 +743,21 @@ def find_issues(data):
 # ---------------------------------------------------------------- main
 
 def summary(data):
-    lines = ["# gadoc inventory %s" % data["collected_at"], "project: %s" % data["project"], ""]
-    g, a = data.get("grok", {}), data.get("agy", {})
-    if g.get("installed"):
-        ins = g.get("inspect") or {}
-        lines.append("grok %s: skills %d, plugins %d, mcp %d, hooks %d, rule files %d" % (
-            g.get("version", "?"), len(ins.get("skills", [])), len(ins.get("plugins", [])),
-            len(ins.get("mcpServers", [])), len(ins.get("hooks", [])), len(ins.get("projectInstructions", []))))
-    if a.get("installed"):
-        lines.append("agy %s: skills %d, plugins %d, mcp %d, hook files %d, rule files %d" % (
-            a.get("version", "?"), len(a.get("skills", [])), len(a.get("plugins", [])),
-            len(a.get("mcp_servers", [])), len(a.get("hooks", [])), len(a.get("rules", []))))
+    lines = ["# gadoc inventory %s" % data["collected_at"], "project: %s  host: %s" % (data["project"], data["host"]), ""]
+    for h in ("grok", "agy"):
+        x = data.get(h, {})
+        if not x.get("installed"):
+            continue
+        kinds = {}
+        for i in x.get("items", []):
+            kinds[i["kind"]] = kinds.get(i["kind"], 0) + 1
+        docs = ", ".join("%s=%s" % (d["command"], d["status"]) for d in x.get("doctors", []))
+        lines.append("%s %s: %s" % (h, x.get("version", "?"), ", ".join("%s %d" % kv for kv in sorted(kinds.items()))))
+        lines.append("  doctor: %s" % docs)
+        lines.append("  usage evidence: %s, %s" % (x["usage_meta"]["window"], x["usage_meta"]["source"]))
     lines.append("")
     for x in data["findings"]:
-        lines.append("[%s] %s %s: %s" % (x["severity"], x["harness"], x["id"], x["title"]))
+        lines.append("[%s] %s %s (%s): %s" % (x["severity"], x["harness"], x["id"], x["class"], x["title"]))
     return "\n".join(lines)
 
 
@@ -531,22 +767,32 @@ def main():
     ap.add_argument("--harness", choices=("grok", "agy", "both"), default="both")
     ap.add_argument("--out")
     ap.add_argument("--summary", action="store_true", help="print a short text summary to stdout")
+    ap.add_argument("--no-connect", action="store_true", help="do not run checks that start MCP servers")
+    ap.add_argument("--usage-days", type=int, default=30, help="recent-use window in days (default 30)")
     args = ap.parse_args()
     project = os.path.abspath(os.path.expanduser(args.project))
 
-    data = {"tool": "gadoc", "collected_at": datetime.datetime.now().isoformat(timespec="seconds"),
-            "project": project, "git_root": git_root(project)}
+    base = {"tool": "gadoc", "collected_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "host": socket.gethostname(), "os": platform.platform(), "project": project}
+    if not os.path.exists(project) or not os.path.isdir(project):
+        base.update(status="error", state="UNVERIFIED",
+                    reason="target path does not exist" if not os.path.exists(project) else "target path is a file, not a directory")
+        print(json.dumps(base, ensure_ascii=False, indent=2))
+        return 2
+
+    data = dict(base, status="ok", git_root=git_root(project))
     if args.harness in ("grok", "both"):
-        data["grok"] = collect_grok(project)
+        data["grok"] = collect_grok(project, args.no_connect, args.usage_days)
     if args.harness in ("agy", "both"):
-        data["agy"] = collect_agy(project)
+        data["agy"] = collect_agy(project, args.usage_days)
     data["shell_aliases"] = collect_shell()
     data["findings"] = find_issues(data)
 
     blob = json.dumps(data, ensure_ascii=False, indent=2)
     if args.out:
-        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-        with open(args.out, "w", encoding="utf-8") as fh:
+        out = os.path.abspath(os.path.expanduser(args.out))
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "w", encoding="utf-8") as fh:
             fh.write(blob)
     if args.summary or not args.out:
         print(summary(data) if args.summary else blob)

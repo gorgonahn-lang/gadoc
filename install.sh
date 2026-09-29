@@ -43,5 +43,5 @@ done
 
 if [[ $mode == install ]]; then
   echo
-  echo "Done. Start a new grok or agy session and ask: \"gadoc으로 하네스 점검해줘\" (grok: /gadoc)."
+  echo "Done. Start a new session: grok \"/gadoc audit .\" | agy \"gadoc audit .\""
 fi
