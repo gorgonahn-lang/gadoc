@@ -1,6 +1,6 @@
 ---
 name: gadoc
-description: "Read-only checkup for a grok (Grok Build) or Antigravity CLI (agy) harness. Use when the wrong skill keeps getting picked, two skills look the same, sessions got slower or noisier after a plugin, skill or MCP server, rule files (AGENTS.md, GEMINI.md, CLAUDE.md) seem to contradict each other, or the user asks to audit, diagnose, clean up or evaluate their grok or agy skills, plugins, MCP servers, hooks or rules. Not for: applying a change (use gadoc-trim), installing anything, editing project source, or Claude Code / Codex (use HarDoc)."
+description: "Read-only checkup for a grok (Grok Build) or Antigravity CLI (agy) harness. Use when the wrong skill keeps getting picked, two skills look the same, sessions got slower or noisier after a plugin, skill or MCP server, rule files (AGENTS.md, GEMINI.md, CLAUDE.md) seem to contradict each other, or the user asks to audit, diagnose, doctor, clean up or evaluate their grok or agy skills, plugins, MCP servers, hooks or rules - including requests like \"run doctor\", \"doctor 돌려줘\", \"닥터 해줘\", \"하네스 닥터\" or \"grok doctor / agy doctor\" said inside a session. Not for: applying a change (use gadoc-trim), installing anything, editing project source, or Claude Code / Codex (use HarDoc)."
 ---
 
 # gadoc
