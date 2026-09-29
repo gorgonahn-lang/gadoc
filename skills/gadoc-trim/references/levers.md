@@ -25,7 +25,7 @@ The runtime writes to some of these files while it is running. Read each file im
 | --- | --- |
 | Anything under `~/.claude/`, and `~/.claude.json` | Claude Code owns them; grok only reads them. Use grok-side levers |
 | `~/.grok/bundled/`, `~/.gemini/antigravity-cli/builtin/` | Shipped with the app; an update restores them |
-| Plugin caches and installed-plugin inventories | Generated. Editing them desynchronizes state |
+| Plugin caches, installed-plugin inventories, generated agent or command files | Generated, not the source. Editing them desynchronizes state. Change the source and let the existing sync produce them |
 | Marketplace registry | Owned by `grok plugin marketplace` / `agy plugin` |
 | Managed or policy settings (`/etc/grok/*`, `~/.grok/managed_config.toml`, `~/.grok/requirements.toml`) | Cannot be overridden, and must not be worked around |
 | `~/.grok/auth.json`, `~/.gemini/antigravity-cli/cache/`, session logs | Credentials and runtime state |

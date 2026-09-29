@@ -46,6 +46,8 @@ Start at `user-invocable-only`. A wrong guess there costs almost nothing: the ca
 | Bundled with the runtime (`~/.grok/bundled`, agy built-ins) | No supported lever. Report only |
 | Anything else, or a source that could not be resolved | No prescription. Report it as `unknown` and leave it alone |
 
+A skipped candidate costs a little standing context; a confidently wrong prescription costs trust in every other row of the table.
+
 When a plugin's skills are the expensive part, the honest proposal is "disable this plugin" with its full cost, not a per-skill edit that cannot reach it. If the person wants to keep part of a plugin, say that the runtime does not support it.
 
 Confirm the behavior against the installed version rather than assuming it. An observation from grok is not evidence about agy, and the other way round; say which runtime an observation came from.

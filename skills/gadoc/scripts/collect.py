@@ -109,21 +109,71 @@ def sha256(path):
         return None
 
 
+RUBY_YAML = ('require "yaml"; require "json"; require "date"; '
+             'd = YAML.safe_load(STDIN.read, permitted_classes: [Date, Time, Symbol]); '
+             'puts JSON.generate(d.is_a?(Hash) ? d : {"__not_a_mapping__" => true})')
+YAML_PARSER = None  # "pyyaml" | "ruby-psych" | "builtin-subset"; set on first use
+
+
+def _yaml_load(block):
+    """Parse a YAML block with a real YAML parser. Returns (dict or None on parse failure)."""
+    global YAML_PARSER
+    try:
+        import yaml  # PyYAML, if installed
+        YAML_PARSER = "pyyaml"
+        try:
+            d = yaml.safe_load(block)
+            return d if isinstance(d, dict) else None
+        except yaml.YAMLError:
+            return None
+    except ImportError:
+        pass
+    ruby = shutil.which("ruby")
+    if ruby:
+        YAML_PARSER = "ruby-psych"
+        try:
+            p = subprocess.run([ruby, "-e", RUBY_YAML], input=block, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, universal_newlines=True, timeout=20)
+            if p.returncode == 0:
+                d = json.loads(p.stdout)
+                return None if d.get("__not_a_mapping__") else d
+            return None
+        except (subprocess.TimeoutExpired, ValueError, OSError):
+            return None
+    YAML_PARSER = "builtin-subset"
+    return _subset_load(block)
+
+
 def frontmatter(path):
-    """Minimal YAML frontmatter reader (scalars, >- and | blocks). Returns None if unreadable,
-    {"__parse_error__": True} if the block is malformed."""
+    """YAML frontmatter of a SKILL.md / rule / command file, read with a real YAML parser so
+    multi-line values and escapes survive. Returns None if the file is unreadable, {} if it has
+    no frontmatter, and {"__parse_error__": True} if the block does not parse - a failure is
+    recorded as unknown, never reconstructed."""
     text = read_text(path, 20000)
     if text is None:
         return None
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
         return {}
-    if not any(l.strip() == "---" for l in lines[1:]):
+    try:
+        end = next(i for i, l in enumerate(lines[1:], 1) if l.strip() == "---")
+    except StopIteration:
         return {"__parse_error__": True}
+    d = _yaml_load("\n".join(lines[1:end]) + "\n")
+    if d is None:
+        return {"__parse_error__": True}
+    return {str(k): ("" if v is None else v if isinstance(v, (bool, int, float)) else str(v).strip())
+            for k, v in d.items()}
+
+
+def _subset_load(block):
+    """Fallback when no YAML library exists: top-level scalars and >- / | blocks only.
+    Anything else (flow maps, anchors, lists) makes the block unparseable -> unknown."""
+    lines = block.splitlines()
+    if any(re.match(r"^\s*[&*!\[{]", l.split(":", 1)[-1].strip() or "x") for l in lines if ":" in l and not l.startswith(" ")):
+        return None
     data, key, block = {}, None, []
-    for line in lines[1:]:
-        if line.strip() == "---":
-            break
+    for line in lines:
         m = re.match(r"^([A-Za-z0-9_-]+):\s*(.*)$", line)
         if m and not line.startswith(" "):
             if key and block:
@@ -215,7 +265,8 @@ def skill_record(skill_md, scope, harness, extra=None):
     rec["name"] = fm.get("name") or rec["dir_name"]
     rec["description"] = fm.get("description", "")
     rec["frontmatter_ok"] = bool(fm.get("name") and fm.get("description"))
-    rec["description_chars"] = len(rec["description"])
+    # A frontmatter that does not parse is unknown: never reconstruct its description or cost.
+    rec["description_chars"] = "unknown" if rec["parse"] == "error" else len(rec["description"])
     rec["hash"] = sha256(skill_md) if rec["exists"] else None
     rec["invocation_policy"] = {
         "disable_model_invocation": truthy(fm.get("disable-model-invocation", "false")),
@@ -235,6 +286,22 @@ def scan_skill_dir(base, scope, harness, extra=None):
         if entry.startswith(".") or not (os.path.isdir(d) or os.path.islink(d)):
             continue
         out.append(skill_record(os.path.join(d, "SKILL.md"), scope, harness, extra))
+    return out
+
+
+def scan_md_dir(base, scope, harness, extra=None):
+    """Command / workflow files (*.md) directly inside `base`."""
+    out = []
+    for f in sorted(glob.glob(os.path.join(base, "*.md"))):
+        fm = frontmatter(f) or {}
+        parse = "error" if fm.get("__parse_error__") else "ok"
+        desc = fm.get("description", "")
+        rec = {"harness": harness, "scope": scope, "name": os.path.splitext(os.path.basename(f))[0],
+               "path": f, "realpath": os.path.realpath(f), "hash": sha256(f), "parse": parse,
+               "description_chars": "unknown" if parse == "error" else len(desc)}
+        if extra:
+            rec.update(extra)
+        out.append(rec)
     return out
 
 
@@ -387,6 +454,21 @@ def collect_grok(project, no_connect, usage_days):
     disk += scan_skill_dir(os.path.join(HOME, ".agents", "skills"), "user-agents-compat", "grok")
     g["skill_dirs_on_disk"] = disk
 
+    # Commands: grok loads Claude Code plugin `commands/` and command folders alongside skills.
+    m = re.search(r"disabled\s*=\s*\[([^\]]*)\]", g["config_toml"].get("plugins", ""))
+    disabled = set(re.findall(r"\"([^\"]+)\"", m.group(1))) if m else set()
+    commands = []
+    for p in ins.get("plugins", []):
+        if p.get("path"):
+            commands += scan_md_dir(os.path.join(p["path"], "commands"), "plugin:" + str(p.get("name")), "grok",
+                                    {"plugin": p.get("name"), "enabled": p.get("name") not in disabled})
+    for d in dirs_root_to_cwd(project):
+        commands += scan_md_dir(os.path.join(d, ".grok", "commands"), "project", "grok")
+        commands += scan_md_dir(os.path.join(d, ".claude", "commands"), "project-claude-compat", "grok")
+    commands += scan_md_dir(os.path.join(GROK_HOME, "commands"), "user", "grok")
+    commands += scan_md_dir(os.path.join(HOME, ".claude", "commands"), "user-claude-compat", "grok")
+    g["commands"] = commands
+
     usage, files_read = usage_from_logs(os.path.join(GROK_HOME, "sessions", "*", "*", "updates.jsonl"), usage_days, _grok_loads)
     usage_meta = {"window": "%dd" % usage_days,
                   "source": "grok session logs on this host (%d sessions; read_file of SKILL.md; gadoc audit sessions excluded)" % files_read}
@@ -420,6 +502,11 @@ def collect_grok(project, no_connect, usage_days):
     for pi in ins.get("projectInstructions", []):
         items.append(dict(kind="rule", name=pi.get("path"), detail=pi,
                           **item(True, True, "always", "n/a", usage_meta, pi.get("sizeBytes", 0), "grok inspect --json")))
+    for c in commands:
+        items.append(dict(kind="command", name=c["name"], source={"type": c["scope"], "path": c["path"]},
+                          hash=c["hash"], description_chars=c["description_chars"],
+                          **item(True, c.get("enabled", True), "unknown (grok inspect does not list commands)",
+                                 "unknown", usage_meta, "unknown", "filesystem scan")))
     g["items"] = items
     return g
 
@@ -583,6 +670,23 @@ def collect_agy(project, usage_days):
         items.append(dict(kind="hook", name=h["path"], source={"type": h["scope"]},
                           **item(True, "unknown", "registered", "unknown", usage_meta, 0, "filesystem scan")))
 
+    # Workflows: agy's slash-command equivalent (deprecated in favour of skills; built-in
+    # `migrate-workflows` converts them).
+    workflows = []
+    for base, scope in [(os.path.join(AGY_CONFIG, "global_workflows"), "global"),
+                        (os.path.join(AGY_CONFIG, "workflows"), "global")] + \
+                       [(os.path.join(r, "workflows"), "workspace") for r in workspace_roots]:
+        workflows += scan_md_dir(base, scope, "agy")
+    for cfg in [os.path.join(AGY_CONFIG, "workflows.json")] + [os.path.join(r, "workflows.json") for r in workspace_roots]:
+        for e in json_entries(cfg):
+            workflows += scan_md_dir(e["path"], "declared", "agy")
+    for w in workflows:
+        items.append(dict(kind="command", name=w["name"], source={"type": w["scope"], "path": w["path"]},
+                          hash=w["hash"], description_chars=w["description_chars"],
+                          **item(True, True, "workflow (slash command)", "unknown", usage_meta, "unknown",
+                                 "filesystem scan")))
+    a["workflows"] = workflows
+
     settings, _ = load_json(os.path.join(AGY_CLI_HOME, "settings.json"))
     a.update(project_dirs=walk, workspace_roots=workspace_roots, rules=rules, plugins=plugins,
              skills=skills, mcp_servers=mcp, hooks=hooks, usage_meta=usage_meta, items=items,
@@ -648,7 +752,7 @@ def find_issues(data):
                 sorted(set((s.get("source") or {}).get("plugin_name") or "~/.claude/skills" for s in compat)),
                 "grok-side [plugins].disabled / [skills].ignore; never edit ~/.claude")
         listed = [i for i in grok.get("items", []) if i["kind"] == "skill" and i["exposed"] == "listed"]
-        total = sum(i["always_cost_chars"] for i in listed)
+        total = sum(i["always_cost_chars"] for i in listed if isinstance(i["always_cost_chars"], int))
         add(f, "GROK-LISTING-COST", "grok", "info", OBS,
             "%d of %d skills listed to the model; descriptions total %d chars (~%d tokens per request)" % (
                 len(listed), len(loaded), total, approx_tokens(total)), None)
@@ -669,6 +773,18 @@ def find_issues(data):
                 add(f, "GROK-MCP-FAILING", "grok", "high", FIX, "`grok mcp doctor` reports failing servers",
                     res.get("servers") or res)
 
+    if grok.get("installed") and grok.get("commands"):
+        cmds = grok["commands"]
+        on = [c for c in cmds if c.get("enabled", True)]
+        add(f, "GROK-COMMANDS", "grok", "info", OBS,
+            "%d command files found (%d from enabled sources); grok inspect does not list them, so exposure is unknown" % (
+                len(cmds), len(on)),
+            sorted(set("%s:%s" % (c["scope"], c["name"]) for c in cmds)),
+            "treat like skills of the same source; a plugin's commands go away with the plugin")
+        for c in cmds:
+            if c["parse"] == "error":
+                add(f, "GROK-COMMAND-PARSE", "grok", "low", FIX, "command frontmatter does not parse", c["path"])
+
     if agy.get("installed"):
         active = [s for s in agy.get("skills", []) if not s.get("excluded")]
         by_name = {}
@@ -686,11 +802,11 @@ def find_issues(data):
                 add(f, "AGY-SKILL-PARSE", "agy", "medium", FIX, "SKILL.md frontmatter does not parse", s["path"])
             elif s["exists"] and not s["frontmatter_ok"]:
                 add(f, "AGY-SKILL-FRONTMATTER", "agy", "medium", FIX, "SKILL.md missing name/description", s["path"])
-            if s["description_chars"] > DESCRIPTION_CHAR_WARN:
+            if isinstance(s["description_chars"], int) and s["description_chars"] > DESCRIPTION_CHAR_WARN:
                 add(f, "AGY-LONG-DESC", "agy", "low", CAND, "skill `%s` description is %d chars" % (
                     s["name"], s["description_chars"]), s["path"])
         listed = [i for i in agy.get("items", []) if i["kind"] == "skill" and i["exposed"] == "listed"]
-        total = sum(i["always_cost_chars"] for i in listed)
+        total = sum(i["always_cost_chars"] for i in listed if isinstance(i["always_cost_chars"], int))
         add(f, "AGY-LISTING-COST", "agy", "info", OBS,
             "%d skills listed to the model; descriptions total %d chars (~%d tokens per request)" % (
                 len(listed), total, approx_tokens(total)), None)
@@ -714,6 +830,10 @@ def find_issues(data):
         for h in agy.get("hooks", []):
             if h.get("error"):
                 add(f, "AGY-HOOKS-CONFIG", "agy", "high", FIX, "hooks.json cannot be parsed", "%s: %s" % (h["path"], h["error"]))
+        if agy.get("workflows"):
+            add(f, "AGY-WORKFLOWS", "agy", "low", CAND,
+                "%d legacy workflow files; agy treats workflows as deprecated in favour of skills" % len(agy["workflows"]),
+                [w["path"] for w in agy["workflows"]], "convert with the built-in migrate-workflows skill (it archives the originals)")
         if str(agy.get("config_json_state", "")).startswith("invalid"):
             add(f, "AGY-CONFIG-JSON", "agy", "high", FIX, "~/.gemini/config/config.json cannot be parsed", agy["config_json_state"])
         for d in agy.get("doctors", []):
@@ -786,6 +906,7 @@ def main():
     if args.harness in ("agy", "both"):
         data["agy"] = collect_agy(project, args.usage_days)
     data["shell_aliases"] = collect_shell()
+    data["yaml_parser"] = YAML_PARSER or "not needed"
     data["findings"] = find_issues(data)
 
     blob = json.dumps(data, ensure_ascii=False, indent=2)
